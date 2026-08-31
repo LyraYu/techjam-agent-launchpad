@@ -1,251 +1,166 @@
-# Volc Agent Launchpad
+# Agent Launchpad — Token Budget Middleware
 
-A minimal Agent platform for three-day middleware hackathons. It provides Agent
-CRUD, a browser Playground, persistent workspaces, and Codex CLI backed by the
-Volcengine Ark Responses API.
+TikTok TechJam 2026 · Track 1 (Agent Launchpad) · solo submission by [LyraYu](https://github.com/LyraYu)
 
-Run it locally with Docker, Colima, or rootless Podman, or deploy it to
-Volcengine ECS.
+This repository is the official Track 1 Starter Kit plus **one middleware capability**:
+a per-Agent token budget, enforced in the control plane before a Run is admitted,
+with a policy event ledger that records every allow / charge / deny / reset decision.
 
-> [!WARNING]
-> This is a single-user proof of concept. It intentionally has no identity,
-> tracing, audit, or hardened sandbox middleware. Do not use production data or
-> credentials. See [SECURITY.md](SECURITY.md).
+The Starter Kit itself (Agent CRUD, Playground, Codex CLI Runtime, containers) is
+unchanged. Its original README is preserved at [docs/STARTER_KIT.md](docs/STARTER_KIT.md).
 
-## Screenshots
+---
 
-### Agent Playground
+## 1. Problem
 
-![Agent Playground showing lifecycle controls, starter prompts, and the Codex Runtime](docs/assets/playground.jpg)
+The Starter Kit already reports token usage for every Run (`RunUsage.inputTokens`,
+`outputTokens`), but the platform does nothing with it. Any Agent can consume an
+unbounded number of model tokens across Runs. There is no per-Agent limit, no
+record of *why* a Run was admitted, and no way for an operator to stop a runaway
+Agent short of deleting it.
 
-### Create an Agent
+This is the "runaway execution or cost" threat from the challenge brief. A single
+ordinary Playground task on this platform costs on the order of tens of thousands
+of tokens (a Node hello-world-with-tests task measured ~94k tokens with
+Seed-2.0-Code), so cost control is an Agent-specific problem, not a generic one.
 
-![Create Agent form with name, description, and workspace instructions](docs/assets/create-agent.jpg)
+## 2. What the middleware does
 
-## Features
+| Capability | Where it executes | Evidence produced |
+|---|---|---|
+| Admission check: deny a Run when `tokensUsed >= tokenBudget` | `AgentService.sendMessage`, inside the same store transaction that reserves the Agent | `budget.allowed` or `budget.denied` event; HTTP `429` on denial |
+| Metering: add the Runtime-reported usage to the Agent meter after a completed Run | `AgentService.executeRun` completion path | `budget.charged` event |
+| Gap recording: note when a failed/cancelled Run reported no usage | `AgentService.executeRun` failure path | `budget.unmetered` event |
+| Recovery: operator clears the meter and optionally sets a new limit | `POST /api/agents/:id/budget/reset` | `budget.reset` event |
+| Configuration | `tokenBudget` on create / update; blank = unlimited | stored on the `Agent` record |
 
-- React and TypeScript Web UI
-- Agent create, edit, start, stop, delete, and multi-turn chat
-- Fastify control plane with asynchronous Run state
-- Persistent Agent workspaces and Codex sessions
-- Disposable Docker, Colima, or Podman container for each local turn
-- Docker and Terraform deployment paths for Volcengine ECS
+The decision logic lives in one pure module, [`apps/server/src/budget-policy.ts`](apps/server/src/budget-policy.ts),
+so it can be unit-tested without a store, a Runtime, or HTTP.
 
-## Requirements
-
-- Node.js 22+
-- npm 10+
-- Docker, Colima, or Podman
-- A Volcengine Ark API key and endpoint that supports the Responses API
-
-Codex CLI is included in the Runtime image and is not required on the host.
-
-## Local browser SOP
-
-### 1. Check the local tools
-
-Install Node.js 22+ and one supported container engine, then verify them:
-
-```bash
-node --version
-npm --version
-docker --version        # Docker Desktop, Docker Engine, or Colima
-podman --version        # Use this instead when running Podman
-```
-
-Only one container engine is required. Codex CLI is already included in the
-Runtime image.
-
-### 2. Clone the repository
-
-```bash
-git clone <repository-url> volc-agent-launchpad
-cd volc-agent-launchpad
-```
-
-Skip this step when already working from the repository root.
-
-### 3. Start the POC
-
-```bash
-ARK_API_KEY=your-ark-api-key \
-ARK_MODEL=ep-your-endpoint-id \
-npm run poc
-```
-
-The first run installs Node.js dependencies and builds the Runtime image. The
-script automatically selects Docker, Colima, or Podman.
-
-### 4. Open the browser
-
-Visit <http://localhost:3000>, or open it from the terminal:
-
-```bash
-open http://localhost:3000       # macOS
-xdg-open http://localhost:3000   # Linux desktop
-```
-
-In the Web UI:
-
-1. Select **Create Agent**.
-2. Enter a name, description, and workspace instructions.
-3. Select **Create Agent** again.
-4. Enter a task in the Playground, for example:
-
-   ```text
-   Create a TypeScript hello-world CLI, add a test, and run it.
-   ```
-
-The Agent can write files, run commands, and continue the same Codex session in
-later messages.
-
-### 5. Stop and resume
-
-Press `Ctrl+C` in the startup terminal. The script removes temporary Runtime
-containers but keeps Agent workspaces and conversations.
-
-- macOS state: `~/.volc-agent-launchpad/`
-- Linux state: `.local/`
-- Custom location: set `LOCAL_POC_DATA_ROOT`
-
-Run the same `npm run poc` command to continue later.
-
-### Select a specific container engine
-
-Force Podman when multiple engines are installed:
-
-```bash
-CONTAINER_ENGINE=podman \
-ARK_API_KEY=your-ark-api-key \
-ARK_MODEL=ep-your-endpoint-id \
-npm run poc
-```
-
-Colima uses `CONTAINER_ENGINE=docker` because it exposes the Docker CLI.
-
-For a clean Linux host, follow the
-[rootless Podman setup](docs/LOCAL_POC.md#rootless-podman-on-linux).
-
-## Docker Compose
-
-Create and edit the configuration:
-
-```bash
-./scripts/bootstrap-local.sh
-```
-
-Required values in `.env`:
-
-```dotenv
-ARK_API_KEY=your-ark-api-key
-ARK_MODEL=ep-your-endpoint-id
-APP_AUTH_TOKEN=replace-with-at-least-24-random-characters
-```
-
-Start the application:
-
-```bash
-docker compose up --build
-```
-
-Open <http://localhost:3000>. Stop it without deleting Agent data:
-
-```bash
-docker compose down
-```
-
-## Development
-
-```bash
-npm install
-cp .env.example .env
-npm install --global @openai/codex@0.111.0
-npm run dev
-```
-
-- Web UI: <http://localhost:5173>
-- API: <http://localhost:3000>
-
-Use local paths in `.env` when running outside Docker:
-
-```dotenv
-APP_DATA_DIR=.data
-AGENT_WORKSPACE_ROOT=workspaces
-CODEX_HOME=codex-home
-```
-
-## Deployment
-
-- [Existing Linux ECS with Docker](docs/DEPLOYMENT.md#existing-linux-ecs)
-- [Complete Volcengine environment with Terraform](docs/DEPLOYMENT.md#terraform-deployment)
-- [Local Docker, Colima, and Podman details](docs/LOCAL_POC.md)
-
-The existing-ECS script deploys from the current source tree:
-
-```bash
-cp .env.example .env.production
-./scripts/deploy-existing-ecs.sh .env.production
-```
-
-The Terraform path provisions VPC, subnet, security group, ECS, and EIP:
-
-```bash
-cp deploy/volcengine/terraform.tfvars.example \
-  deploy/volcengine/terraform.tfvars
-./scripts/deploy-volcengine.sh
-```
-
-## Configuration
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ARK_API_KEY` | Required | Ark model API key. |
-| `ARK_MODEL` | Required | Responses-capable endpoint or model ID. |
-| `ARK_BASE_URL` | Beijing v3 endpoint | Ark OpenAI-compatible API URL. |
-| `APP_AUTH_TOKEN` | Empty on loopback | Shared demo token; use 24+ random characters remotely. |
-| `RUNTIME_PROVIDER` | `local-process` | `container` for disposable local Runtime containers. |
-| `CODEX_SANDBOX_MODE` | `workspace-write` | Codex inner sandbox mode. |
-| `CODEX_TIMEOUT_MS` | `600000` | Maximum duration of one turn. |
-| `LOCAL_POC_DATA_ROOT` | Platform-specific | Local metadata, workspace, and session directory. |
-
-See [.env.example](.env.example) for all Runtime and resource-limit options.
-
-## How it works
+## 3. Architecture and trust boundary
 
 ```mermaid
 flowchart LR
-    UI["React Web UI"] --> API["Fastify control plane"]
-    API --> Store["JSON metadata and Agent workspaces"]
-    API --> Runtime{"Runtime provider"}
-    Runtime -->|Local POC| Container["Disposable Docker / Colima / Podman container"]
-    Runtime -->|ECS profile| Codex["Codex CLI in application container"]
-    Container --> Ark["Volcengine Ark Responses API"]
-    Codex --> Ark
+  UI[React Web UI<br/>budget field · Budget panel] -->|POST /messages| API[Fastify API]
+  API --> SVC[AgentService<br/>control plane]
+  SVC -->|1. evaluateBudget| POL[budget-policy.ts<br/>pure decision]
+  SVC -->|2. commit decision + Run atomically| DB[(launchpad.json<br/>agents · runs · policyEvents)]
+  SVC -->|3. only if allowed| RUN[AgentRunner<br/>Codex CLI in container]
+  RUN -->|usage on turn.completed| SVC
+  SVC -->|4. charge meter| DB
+  UI -->|GET /policy-events| API
+  UI -->|POST /budget/reset| API
 ```
 
-The first turn uses `codex exec`; later turns resume the stored Codex thread.
-Deleting an Agent archives its workspace under `workspaces/.deleted/`.
+A one-page version is in [docs/architecture.svg](docs/architecture.svg).
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component and extension
-boundaries.
+**Who owns the decision.** The control plane (`AgentService`). The UI only
+displays state; a client that bypasses the UI still hits the same check.
 
-## Validation
+**What crosses the boundary.** Inbound: the Agent's `tokenBudget` and
+`tokensUsed`. Outbound to the Runtime: nothing new — the Runtime is only invoked
+if the decision was *allow*. Inbound from the Runtime: `RunUsage`, which is the
+sole source of truth for charging.
+
+**Why admission is atomic.** The budget check runs inside the same
+`JsonStore.mutate` transaction that flips the Agent to `busy`. Because the
+platform admits at most one Run per Agent at a time, the check-then-charge
+sequence cannot double-spend: no second Run can pass the check until the first
+has been charged.
+
+**Why a denial is committed as data.** A first implementation threw the `429`
+from inside the transaction, which rolled back the ledger entry together with
+the rejected Run — the denial left no trace. The current code returns the
+decision from the transaction, persists the `budget.denied` event, and throws
+afterwards. The evidence survives the refusal.
+
+**What happens on failure.** If the Runtime fails or is cancelled it reports no
+usage. The meter is left unchanged and a `budget.unmetered` event is written so
+the ledger has an entry for every Run, including the ones it could not bill.
+
+## 4. API
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/agents` | body may include `tokenBudget: number \| null` |
+| `PATCH` | `/api/agents/:id` | same field |
+| `POST` | `/api/agents/:id/messages` | returns `429` with the denial reason when the budget is exhausted; no Run or message is created |
+| `GET` | `/api/agents/:id/policy-events` | ledger, newest first |
+| `POST` | `/api/agents/:id/budget/reset` | body `{ tokenBudget?: number \| null }`; `409` while a Run is active |
+
+`Agent` records gain two fields: `tokenBudget` (`null` = unlimited) and
+`tokensUsed`. Existing `launchpad.json` files are upgraded in place with safe
+defaults on startup; the database version stays `1`.
+
+## 5. Run it
+
+Requirements are unchanged from the Starter Kit: Node 22+, npm 10+, and Docker /
+Colima / Podman. You also need a ModelArk API key and an endpoint ID that
+supports the Responses API.
 
 ```bash
-npm run check
-terraform fmt -check -recursive deploy/volcengine
-docker compose config
+git clone https://github.com/LyraYu/techjam-agent-launchpad.git
+cd techjam-agent-launchpad
+ARK_API_KEY=your-ark-api-key \
+ARK_MODEL=ep-your-endpoint-id \
+ARK_BASE_URL=https://ark.ap-southeast.bytepluses.com/api/v3 \
+npm run poc
 ```
 
-## Documentation
+Open http://localhost:3000. `ARK_BASE_URL` is required for BytePlus (international)
+accounts; the Starter Kit default points at Volcengine China.
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Local POC](docs/LOCAL_POC.md)
-- [Deployment](docs/DEPLOYMENT.md)
-- [Hackathon extension guide](docs/HACKATHON_EXTENSION_GUIDE.md)
-- [Security policy](SECURITY.md)
-- [Contributing](CONTRIBUTING.md)
+Verification:
 
-## License
+```bash
+npm run check   # typecheck + vitest + production build
+```
 
-[MIT](LICENSE)
+## 6. Tests
+
+New tests (9) alongside the Starter Kit's existing 13:
+
+- `budget-policy.test.ts` — pure decisions: unlimited, remaining, exhausted, usage summing.
+- `agent-budget.test.ts`
+  - full scenario through `AgentService`: allow → charge → allow → charge → **deny (429)** → assert no Run, no message, no Runtime call leaked → reset → allow again; asserts the exact ledger sequence.
+  - an Agent without a budget is metered but never denied.
+  - reset is refused (`409`) while a Run is active.
+  - a failed Run leaves the meter unchanged and writes `budget.unmetered`.
+  - a pre-middleware `launchpad.json` is upgraded with defaults.
+  - HTTP boundary: `201` create with budget, `202` admit, `429` deny, ledger readable, reset returns `tokensUsed: 0`, negative budget rejected with `400`.
+
+## 7. Demo script (3 minutes)
+
+1. Create an Agent with **Token budget = 150000**.
+2. Send a task, e.g. *"Create a small Node.js script that prints a 1–9 multiplication table, add a test with node:test, and run it."* Show the Run completing and the Budget panel updating (`budget.allowed`, then `budget.charged` with the real token count).
+3. Send a second task. It is admitted (tokens remain) and pushes the meter past the limit.
+4. Send a third task. The control plane returns `429`; the panel shows a red `budget.denied`. Point out that the server log shows **no container start** — the Runtime was never invoked.
+5. Click **Reset budget**. `budget.reset` appears, meter returns to 0.
+6. Send once more: admitted and completed. The Agent remains inspectable and controllable throughout.
+
+## 8. Limitations (and why)
+
+1. **Enforcement is per-Run, not intra-Run.** A Run that starts with 1 token
+   remaining can still consume 90k tokens. Codex CLI reports usage only on the
+   `turn.completed` event, so there is no mid-turn signal to act on. A hard
+   intra-Run cap would need a metering proxy in front of the Ark endpoint or
+   Runner-level cancellation on a wall-clock/step budget; that is the natural next
+   step and belongs at the Runtime boundary, not the control plane.
+2. **Failed or cancelled Runs are not charged.** The Runtime returns no usage on
+   error. A prompt that reliably crashes the Run could consume tokens without ever
+   being billed. The `budget.unmetered` event makes this visible rather than
+   silent, but does not close the gap.
+3. **Reset has no principal.** The platform has no user identity, so "operator"
+   means anyone with API access. Pairing this middleware with an identity layer
+   would make reset an attributed, approvable action.
+4. **Cached input tokens are not billed.** `cachedInputTokens` is reported but
+   excluded from the meter, since cache hits are priced differently. This is a
+   policy choice, documented here.
+5. **The ledger grows without bound** in the JSON store, and the UI shows only the
+   latest 8 events. Retention and pagination were out of scope.
+
+## 9. Contributions
+
+Solo submission. All middleware code, tests, and documentation by LyraYu, with an
+AI coding assistant used for drafting and review. No secrets are committed;
+`.env`, `.data/`, `workspaces/`, and `codex-home/` are git-ignored.
