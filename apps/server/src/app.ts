@@ -10,10 +10,15 @@ import type { AgentService } from "./agent-service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
+const tokenBudgetField = z.number().int().positive().max(1_000_000_000).nullable();
 const createAgentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
   instructions: z.string().max(10_000).optional(),
+  tokenBudget: tokenBudgetField.optional(),
+});
+const resetBudgetBody = z.object({
+  tokenBudget: tokenBudgetField.optional(),
 });
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
@@ -114,6 +119,17 @@ export async function createApp(
   app.get("/api/agents/:id/runs", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { runs: service.getRuns(id) };
+  });
+
+  app.get("/api/agents/:id/policy-events", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { events: service.getPolicyEvents(id) };
+  });
+
+  app.post("/api/agents/:id/budget/reset", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const body = resetBudgetBody.parse(request.body ?? {});
+    return { agent: await service.resetBudget(id, body) };
   });
 
   app.post("/api/agents/:id/messages", async (request, reply) => {

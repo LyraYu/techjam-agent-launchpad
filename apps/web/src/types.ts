@@ -10,8 +10,28 @@ export interface Agent {
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
+  tokenBudget: number | null;
+  tokensUsed: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export type PolicyEventType =
+  | "budget.allowed"
+  | "budget.denied"
+  | "budget.charged"
+  | "budget.unmetered"
+  | "budget.reset";
+
+export interface PolicyEvent {
+  id: string;
+  agentId: string;
+  runId: string | null;
+  type: PolicyEventType;
+  tokensUsed: number;
+  tokenBudget: number | null;
+  detail: string;
+  createdAt: string;
 }
 
 export interface Message {

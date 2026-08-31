@@ -7,7 +7,18 @@ const emptyDatabase = (): Database => ({
   agents: [],
   messages: [],
   runs: [],
+  policyEvents: [],
 });
+
+/** Older launchpad.json files predate the budget middleware; fill defaults. */
+function normalize(database: Database): Database {
+  database.policyEvents ??= [];
+  for (const agent of database.agents) {
+    agent.tokenBudget ??= null;
+    agent.tokensUsed ??= 0;
+  }
+  return database;
+}
 
 export class JsonStore {
   private data: Database = emptyDatabase();
@@ -23,7 +34,7 @@ export class JsonStore {
       if (parsed.version !== 1 || !Array.isArray(parsed.agents)) {
         throw new Error("Unsupported database format");
       }
-      this.data = parsed;
+      this.data = normalize(parsed);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw error;

@@ -11,6 +11,8 @@ export interface Agent {
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
+  tokenBudget: number | null;
+  tokensUsed: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -43,23 +45,48 @@ export interface AgentRun {
   createdAt: string;
 }
 
+export type PolicyEventType =
+  | "budget.allowed"
+  | "budget.denied"
+  | "budget.charged"
+  | "budget.unmetered"
+  | "budget.reset";
+
+export interface PolicyEvent {
+  id: string;
+  agentId: string;
+  runId: string | null;
+  type: PolicyEventType;
+  tokensUsed: number;
+  tokenBudget: number | null;
+  detail: string;
+  createdAt: string;
+}
+
 export interface Database {
   version: 1;
   agents: Agent[];
   messages: Message[];
   runs: AgentRun[];
+  policyEvents: PolicyEvent[];
 }
 
 export interface CreateAgentInput {
   name: string;
   description?: string | undefined;
   instructions?: string | undefined;
+  tokenBudget?: number | null | undefined;
 }
 
 export interface UpdateAgentInput {
   name?: string | undefined;
   description?: string | undefined;
   instructions?: string | undefined;
+  tokenBudget?: number | null | undefined;
+}
+
+export interface ResetBudgetInput {
+  tokenBudget?: number | null | undefined;
 }
 
 export interface RunnerResult {

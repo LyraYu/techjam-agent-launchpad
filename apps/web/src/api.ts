@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Message, PolicyEvent, SystemInfo } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -40,6 +40,7 @@ export const api = {
     name: string;
     description: string;
     instructions: string;
+    tokenBudget: number | null;
   }) =>
     request<{ agent: Agent }>("/api/agents", {
       method: "POST",
@@ -47,7 +48,7 @@ export const api = {
     }),
   updateAgent: (
     id: string,
-    body: { name: string; description: string; instructions: string },
+    body: { name: string; description: string; instructions: string; tokenBudget: number | null },
   ) =>
     request<{ agent: Agent }>("/api/agents/" + id, {
       method: "PATCH",
@@ -78,4 +79,11 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  policyEvents: (id: string) =>
+    request<{ events: PolicyEvent[] }>("/api/agents/" + id + "/policy-events"),
+  resetBudget: (id: string, tokenBudget?: number | null) =>
+    request<{ agent: Agent }>("/api/agents/" + id + "/budget/reset", {
+      method: "POST",
+      body: JSON.stringify(tokenBudget === undefined ? {} : { tokenBudget }),
+    }),
 };

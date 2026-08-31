@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Message, PolicyEvent, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -13,7 +13,75 @@ const emptyForm = {
   description: "",
   instructions:
     "Help me build and test software in this workspace. Keep changes small and explain the result.",
+  tokenBudget: "",
 };
+
+/** Form field is free text; the API wants a positive integer or null (unlimited). */
+function parseBudget(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+function BudgetPanel({
+  agent,
+  events,
+  busy,
+  onReset,
+}: {
+  agent: Agent;
+  events: PolicyEvent[];
+  busy: boolean;
+  onReset: () => void;
+}) {
+  const limit = agent.tokenBudget;
+  const used = agent.tokensUsed;
+  const exhausted = limit !== null && used >= limit;
+  const percent = limit === null ? 0 : Math.min(100, Math.round((used / limit) * 100));
+  return (
+    <section className="budget-panel" aria-label="Token budget">
+      <div className="budget-head">
+        <div>
+          <span className="eyebrow">Middleware · Token budget</span>
+          <h2>
+            {limit === null
+              ? used.toLocaleString() + " tokens used · no limit"
+              : used.toLocaleString() + " / " + limit.toLocaleString() + " tokens"}
+          </h2>
+        </div>
+        <button
+          className="button button-ghost"
+          onClick={onReset}
+          disabled={busy || agent.status === "busy"}
+          title="Clear the token meter so runs can resume"
+        >
+          Reset budget
+        </button>
+      </div>
+      {limit !== null && (
+        <div className={"budget-bar" + (exhausted ? " budget-bar-exhausted" : "")}>
+          <div style={{ width: percent + "%" }} />
+        </div>
+      )}
+      {exhausted && (
+        <p className="budget-warning">
+          Budget exhausted. New runs are denied at the control plane until an operator resets it.
+        </p>
+      )}
+      <ul className="budget-events">
+        {events.length === 0 && <li className="budget-empty">No policy decisions yet.</li>}
+        {events.slice(0, 8).map((event) => (
+          <li key={event.id} className={"budget-event budget-event-" + event.type.split(".")[1]}>
+            <span className="budget-event-type">{event.type}</span>
+            <span className="budget-event-detail">{event.detail}</span>
+            <span className="budget-event-time">{formatTime(event.createdAt)}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -45,6 +113,7 @@ export default function App() {
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  const [policyEvents, setPolicyEvents] = useState<PolicyEvent[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
@@ -101,8 +170,10 @@ export default function App() {
     setShowSettings(false);
     if (!selectedId) {
       setMessages([]);
+      setPolicyEvents([]);
       return;
     }
+    void refreshPolicyEvents(selectedId);
     void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
       .then(([, result]) => {
         if (selectedIdRef.current !== selectedId) return;
@@ -125,9 +196,33 @@ export default function App() {
         name: selected.name,
         description: selected.description,
         instructions: selected.instructions,
+        tokenBudget: selected.tokenBudget === null ? "" : String(selected.tokenBudget),
       });
     }
   }, [selected]);
+
+  const refreshPolicyEvents = useCallback(async (agentId: string) => {
+    try {
+      const result = await api.policyEvents(agentId);
+      if (selectedIdRef.current === agentId) setPolicyEvents(result.events);
+    } catch {
+      // Evidence panel is best-effort; the run itself is unaffected.
+    }
+  }, []);
+
+  const resetBudget = async () => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.resetBudget(selected.id);
+      await Promise.all([refreshAgents(), refreshPolicyEvents(selected.id)]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     messageEnd.current?.scrollIntoView({ behavior: "smooth" });
@@ -138,7 +233,7 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const { agent } = await api.createAgent(form);
+      const { agent } = await api.createAgent({ ...form, tokenBudget: parseBudget(form.tokenBudget) });
       await refreshAgents();
       setSelectedId(agent.id);
       setShowCreate(false);
@@ -156,7 +251,7 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      await api.updateAgent(selected.id, form);
+      await api.updateAgent(selected.id, { ...form, tokenBudget: parseBudget(form.tokenBudget) });
       await refreshAgents();
       setShowSettings(false);
     } catch (reason) {
@@ -211,7 +306,11 @@ export default function App() {
         const result = await api.run(runId);
         if (selectedIdRef.current === agentId) setActiveRun(result.run);
         if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
+          await Promise.all([
+            refreshMessages(agentId),
+            refreshAgents(),
+            refreshPolicyEvents(agentId),
+          ]);
           return;
         }
       }
@@ -241,7 +340,7 @@ export default function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       setActiveRun(null);
-      await refreshAgents();
+      await Promise.all([refreshAgents(), refreshPolicyEvents(selected.id)]);
     }
   };
 
@@ -468,6 +567,17 @@ export default function App() {
                     maxLength={10_000}
                   />
                 </label>
+                <label>
+                  Token budget (blank = unlimited)
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    placeholder="e.g. 20000"
+                    value={form.tokenBudget}
+                    onChange={(event) => setForm({ ...form, tokenBudget: event.target.value })}
+                  />
+                </label>
                 <div className="panel-footer">
                   <code>{selected.workspacePath}</code>
                   <button className="button button-primary" disabled={busy}>
@@ -476,6 +586,13 @@ export default function App() {
                 </div>
               </form>
             )}
+
+            <BudgetPanel
+              agent={selected}
+              events={policyEvents}
+              busy={busy}
+              onReset={resetBudget}
+            />
 
             <section className="playground">
               <div className="playground-topbar">
@@ -648,6 +765,17 @@ export default function App() {
                 }
                 rows={6}
                 maxLength={10_000}
+              />
+            </label>
+            <label>
+              Token budget (blank = unlimited)
+              <input
+                type="number"
+                min={1}
+                step={1}
+                placeholder="e.g. 20000"
+                value={form.tokenBudget}
+                onChange={(event) => setForm({ ...form, tokenBudget: event.target.value })}
               />
             </label>
             <div className="modal-footer">

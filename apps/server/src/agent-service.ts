@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
+import { evaluateBudget, makePolicyEvent, tokensFromUsage } from "./budget-policy.js";
 import { HttpError, RunCancelledError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type {
@@ -9,6 +10,8 @@ import type {
   AgentRunner,
   CreateAgentInput,
   Message,
+  PolicyEvent,
+  ResetBudgetInput,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -72,6 +75,8 @@ export class AgentService {
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
+      tokenBudget: input.tokenBudget ?? null,
+      tokensUsed: 0,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
@@ -96,6 +101,7 @@ export class AgentService {
       if (input.name !== undefined) agent.name = input.name.trim();
       if (input.description !== undefined) agent.description = input.description.trim();
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
+      if (input.tokenBudget !== undefined) agent.tokenBudget = input.tokenBudget;
       agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);
@@ -112,6 +118,7 @@ export class AgentService {
       database.agents = database.agents.filter((item) => item.id !== id);
       database.messages = database.messages.filter((item) => item.agentId !== id);
       database.runs = database.runs.filter((item) => item.agentId !== id);
+      database.policyEvents = database.policyEvents.filter((item) => item.agentId !== id);
     });
     return { archivedWorkspace };
   }
@@ -150,6 +157,54 @@ export class AgentService {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
+  getPolicyEvents(agentId: string): PolicyEvent[] {
+    this.getAgent(agentId);
+    return this.store
+      .snapshot()
+      .policyEvents.filter((event) => event.agentId === agentId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  /**
+   * Recovery control: clear the Agent's token meter and optionally set a new
+   * limit. This is a human operation, so it is recorded as its own event.
+   */
+  async resetBudget(agentId: string, input: ResetBudgetInput = {}): Promise<Agent> {
+    this.getAgent(agentId);
+    return this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!agent) {
+        throw new HttpError(404, "Agent not found");
+      }
+      if (agent.status === "busy") {
+        throw new HttpError(409, "Stop the active run before resetting the budget");
+      }
+      const timestamp = now();
+      const previousUsed = agent.tokensUsed;
+      agent.tokensUsed = 0;
+      if (input.tokenBudget !== undefined) agent.tokenBudget = input.tokenBudget;
+      agent.updatedAt = timestamp;
+      database.policyEvents.push(
+        makePolicyEvent(
+          randomUUID(),
+          agentId,
+          null,
+          "budget.reset",
+          agent,
+          "Budget reset by operator (cleared " +
+            previousUsed +
+            " used tokens" +
+            (input.tokenBudget !== undefined
+              ? ", new limit " + (input.tokenBudget ?? "unlimited")
+              : "") +
+            ")",
+          timestamp,
+        ),
+      );
+      return structuredClone(agent);
+    });
+  }
+
   async sendMessage(
     agentId: string,
     prompt: string,
@@ -182,7 +237,11 @@ export class AgentService {
       content: prompt,
       createdAt: timestamp,
     };
-    const agentAtStart = await this.store.mutate((database) => {
+    // Admission is one atomic transaction: the budget decision, its ledger
+    // entry, and (if allowed) the new Run all commit together. A denial is
+    // committed as data rather than thrown from inside the transaction, so
+    // the evidence survives even though no Run is created.
+    const admission = await this.store.mutate((database) => {
       const storedAgent = database.agents.find((item) => item.id === agentId);
       if (!storedAgent) {
         throw new HttpError(404, "Agent not found");
@@ -193,14 +252,35 @@ export class AgentService {
       if (storedAgent.status === "busy") {
         throw new HttpError(409, "This Agent is already running");
       }
+      // Policy boundary: the budget decision happens here, in the control
+      // plane, before any Run, message, or Runtime container exists.
+      const decision = evaluateBudget(storedAgent);
+      database.policyEvents.push(
+        makePolicyEvent(
+          randomUUID(),
+          agentId,
+          decision.allowed ? runId : null,
+          decision.allowed ? "budget.allowed" : "budget.denied",
+          storedAgent,
+          decision.detail,
+          timestamp,
+        ),
+      );
+      if (!decision.allowed) {
+        return { denied: decision.detail, snapshot: null };
+      }
       database.runs.push(run);
       database.messages.push(message);
       const snapshot = structuredClone(storedAgent);
       storedAgent.status = "busy";
       storedAgent.lastError = null;
       storedAgent.updatedAt = timestamp;
-      return snapshot;
+      return { denied: null, snapshot };
     });
+    if (admission.denied !== null || admission.snapshot === null) {
+      throw new HttpError(429, admission.denied ?? "Run denied by policy");
+    }
+    const agentAtStart = admission.snapshot;
     const execution = this.executeRun(agentAtStart, run);
     this.activeExecutions.set(agentId, execution);
     void execution
@@ -259,6 +339,24 @@ export class AgentService {
         storedRun.output = result.output;
         storedRun.usage = result.usage;
         storedRun.completedAt = completedAt;
+        const charged = tokensFromUsage(result.usage);
+        agent.tokensUsed += charged;
+        database.policyEvents.push(
+          makePolicyEvent(
+            randomUUID(),
+            agent.id,
+            run.id,
+            "budget.charged",
+            agent,
+            "Charged " +
+              charged +
+              " tokens for this run" +
+              (agent.tokenBudget !== null && agent.tokensUsed >= agent.tokenBudget
+                ? "; budget is now exhausted"
+                : ""),
+            completedAt,
+          ),
+        );
         database.messages.push({
           id: randomUUID(),
           agentId: agent.id,
@@ -290,6 +388,21 @@ export class AgentService {
           }
           agent.lastError = cancelled ? null : message;
           agent.updatedAt = completedAt;
+          // The Runtime only reports usage on a completed turn, so tokens
+          // consumed by a failed or cancelled Run cannot be charged. Record
+          // that gap explicitly rather than leaving a silent hole in the ledger.
+          database.policyEvents.push(
+            makePolicyEvent(
+              randomUUID(),
+              agent.id,
+              run.id,
+              "budget.unmetered",
+              agent,
+              (cancelled ? "Run cancelled" : "Run failed") +
+                "; Runtime reported no usage, so no tokens were charged (known limitation)",
+              completedAt,
+            ),
+          );
         }
       });
     }
